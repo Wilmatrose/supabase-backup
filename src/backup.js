@@ -7,7 +7,7 @@ import crypto from 'crypto';
 const { Pool } = pg;
 
 const TABLES = [
-  { name: 'users', columns: 'id, username, email, "fullName", bio, "avatar_url", role, "coin_balance", "kycStatus", "id_card_url", "verification_video_url", status, "country_code", "device_type", "last_login_ip", "last_active_at", "followers_count", "following_count", "is_anonymous", "banned_until", "locked_until", "failed_login_attempts", "created_at", "updated_at", "deleted_at"' },
+   { name: 'users', columns: '*' },
   { name: 'transactions', columns: '*' },
   { name: 'gifts', columns: '*' },
   { name: 'user_follows', columns: '*' },
