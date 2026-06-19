@@ -6,7 +6,6 @@
     "start": "node src/backup.js"
   },
   "dependencies": {
-    "googleapis": "^140.0.0",
     "pg": "^8.13.0"
   }
 }

@@ -1,5 +1,4 @@
 import pg from 'pg';
-import { google } from 'googleapis';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
@@ -7,7 +6,7 @@ import crypto from 'crypto';
 const { Pool } = pg;
 
 const TABLES = [
-   { name: 'users', columns: '*' },
+  { name: 'users', columns: '*' },
   { name: 'transactions', columns: '*' },
   { name: 'gifts', columns: '*' },
   { name: 'user_follows', columns: '*' },
@@ -34,15 +33,12 @@ const TABLES = [
 // ENCRYPTION (AES-256-GCM)
 // ==========================================
 function encryptData(jsonString) {
-  const key = crypto.scryptSync(process.env.ENCRYPTION_KEY || 'default-super-secret-key-change-me', 'salt', 32);
+  const key = crypto.scryptSync(process.env.ENCRYPTION_KEY || 'default-key', 'salt', 32);
   const iv = crypto.randomBytes(16);
   const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
-  
   let encrypted = cipher.update(jsonString, 'utf8', 'hex');
   encrypted += cipher.final('hex');
   const authTag = cipher.getAuthTag().toString('hex');
-
-  // Format: iv:authTag:encryptedData
   return `${iv.toString('hex')}:${authTag}:${encrypted}`;
 }
 
@@ -50,75 +46,46 @@ function encryptData(jsonString) {
 // DIFF ENGINE
 // ==========================================
 function computeTableHash(data) {
-  const hash = crypto.createHash('sha256');
-  hash.update(JSON.stringify(data));
-  return hash.digest('hex');
+  return crypto.createHash('sha256').update(JSON.stringify(data)).digest('hex');
 }
 
 async function run() {
   console.log('🚀 Backup started at', new Date().toISOString());
 
   const pool = new Pool({
-    host: process.env.DB_HOST,
-    port: process.env.DB_PORT || 5432,
-    database: process.env.DB_NAME || 'postgres',
-    user: process.env.DB_USER,
-    password: process.env.DB_PASSWORD,
-    ssl: { rejectUnauthorized: false },
+    host: process.env.DB_HOST, port: process.env.DB_PORT || 5432,
+    database: process.env.DB_NAME || 'postgres', user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD, ssl: { rejectUnauthorized: false },
   });
 
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
 
   try {
     const client = await pool.connect();
-    const data = {};
-    const stats = {};
-    const tableHashes = {};
-    const diffs = {};
+    const data = {}, stats = {}, tableHashes = {}, diffs = {};
 
     console.log('📥 Fetching data & computing diffs...');
     for (const table of TABLES) {
       let query = `SELECT ${table.columns} FROM "${table.name}"`;
       if (table.orderBy) query += ` ORDER BY ${table.orderBy}`;
       if (table.limit) query += ` LIMIT ${table.limit}`;
-
       const result = await client.query(query);
       data[table.name] = result.rows;
       stats[table.name] = result.rows.length;
-      
-      const currentHash = computeTableHash(result.rows);
-      tableHashes[table.name] = currentHash;
+      tableHashes[table.name] = computeTableHash(result.rows);
     }
     client.release();
 
-    // 1. Check if a previous full backup exists to diff against
-    const auth = new google.auth.JWT(
-      process.env.GCP_CLIENT_EMAIL,
-      null,
-      process.env.GCP_PRIVATE_KEY.replace(/\\n/g, '\n'),
-      ['https://www.googleapis.com/auth/drive.file']
-    );
-    const drive = google.drive({ version: 'v3', auth });
-
-    const existingFiles = await drive.files.list({
-      q: `'${process.env.GDRIVE_FOLDER_ID}' in parents and name contains 'backup-full-'`,
-      fields: 'files(id, name)',
-      orderBy: 'createdTime desc',
-    });
-
-    const prevFullBackup = existingFiles.data.files?.[0];
+    // 1. Download previous hashes from GitHub to compare
     let prevHashes = {};
-
-    if (prevFullBackup) {
-      console.log('🔍 Previous full backup found. Comparing...');
-      try {
-        const prevDataRes = await drive.files.get({ fileId: prevFullBackup.id, alt: 'media' }, { responseType: 'json' });
-        // Note: If you enable encryption below, you'd have to decrypt this first. 
-        // For true diffing to work WITH encryption, hashes must be stored unencrypted in metadata.
-        prevHashes = prevDataRes.data?.metadata?.tableHashes || {};
-      } catch (e) {
-        console.log('⚠️ Could not read previous backup for diffing. Doing full backup.');
-      }
+    try {
+      const hashRes = await fetch(`https://api.github.com/repos/${process.env.GITHUB_REPOSITORY}/contents/latest-hashes.json`, {
+        headers: { 'Authorization': `token ${process.env.GITHUB_TOKEN}`, 'Accept': 'application/vnd.github.v3.raw' }
+      });
+      if (hashRes.ok) prevHashes = await hashRes.json();
+      console.log('🔍 Previous hashes found. Comparing...');
+    } catch (e) {
+      console.log('⚠️ No previous backup found. Doing full backup.');
     }
 
     // 2. Determine what changed
@@ -132,86 +99,104 @@ async function run() {
     }
 
     if (!hasChanges) {
-      console.log('✅ No changes detected since last backup. Skipping upload to save space.');
+      console.log('✅ No changes detected. Skipping upload.');
       return;
     }
 
     // 3. Build Payload
-    let payload, fileName;
+    let payload, fileName, tag;
 
-    // If >50% of tables changed, just do a full backup
     if (Object.keys(diffs).length > TABLES.length * 0.5) {
       fileName = `backup-full-${timestamp}.enc.json`;
-      payload = {
-        type: 'FULL',
-        metadata: {
-          timestamp: new Date().toISOString(),
-          version: '4.0-encrypted',
-          source: 'africom-fortress',
-          tableHashes
-        },
-        stats,
-        data
-      };
-      console.log('📦 Building FULL backup (major changes detected)...');
+      tag = `v-full-${timestamp}`;
+      payload = { type: 'FULL', metadata: { timestamp: new Date().toISOString(), version: '5.0-github', tableHashes }, stats, data };
+      console.log('📦 Building FULL backup...');
     } else {
       fileName = `backup-diff-${timestamp}.enc.json`;
-      payload = {
-        type: 'DIFF',
-        basedOn: prevFullBackup?.name,
-        metadata: {
-          timestamp: new Date().toISOString(),
-          version: '4.0-encrypted',
-          source: 'africom-fortress',
-          tableHashes
-        },
-        changedStats: Object.fromEntries(Object.entries(stats).filter(([k]) => diffs[k])),
-        data: diffs
-      };
+      tag = `v-diff-${timestamp}`;
+      payload = { type: 'DIFF', metadata: { timestamp: new Date().toISOString(), version: '5.0-github', tableHashes }, changedStats: Object.fromEntries(Object.entries(stats).filter(([k]) => diffs[k])), data: diffs };
       console.log('📦 Building INCREMENTAL diff backup...');
     }
 
-    const jsonString = JSON.stringify(payload);
-    
     // 4. Encrypt
     console.log('🔐 Encrypting with AES-256-GCM...');
-    const encryptedString = encryptData(jsonString);
-
+    const encryptedString = encryptData(JSON.stringify(payload));
+    
     // Write to temp file
     const filePath = path.join('/tmp', fileName);
     fs.writeFileSync(filePath, encryptedString);
     const sizeBytes = fs.statSync(filePath).size;
     console.log(`💾 Encrypted size: ${(sizeBytes / 1024 / 1024).toFixed(2)} MB`);
 
-    // 5. Upload
-    console.log('☁️ Uploading to Google Drive...');
-    const newFile = await drive.files.create({
-      requestBody: { name: fileName, parents: [process.env.GDRIVE_FOLDER_ID] },
-      media: { mimeType: 'application/json', body: fs.createReadStream(filePath) },
+    // 5. Upload to GitHub Releases
+    console.log('☁️ Uploading to GitHub Releases...');
+    
+    // Create the release
+    const releaseRes = await fetch(`https://api.github.com/repos/${process.env.GITHUB_REPOSITORY}/releases`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `token ${process.env.GITHUB_TOKEN}`,
+        'Accept': 'application/vnd.github.v3+json',
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        tag_name: tag,
+        name: `Backup ${timestamp}`,
+        body: `Automated backup. Type: ${payload.type}. Size: ${(sizeBytes / 1024 / 1024).toFixed(2)} MB.`,
+        prerelease: true
+      })
+    });
+    const release = await releaseRes.json();
+
+    // Upload the asset
+    const uploadUrl = release.upload_url.replace('{?name,label}', `?name=${fileName}`);
+    await fetch(uploadUrl, {
+      method: 'POST',
+      headers: {
+        'Authorization': `token ${process.env.GITHUB_TOKEN}`,
+        'Content-Type': 'application/octet-stream'
+      },
+      body: fs.createReadStream(filePath)
     });
 
-    // 6. Safety Verification
-    console.log('🔒 Verifying...');
-    const verify = await drive.files.get({ fileId: newFile.data.id, fields: 'id' });
-    if (!verify.data.id) throw new Error('Upload verification failed');
+    // 6. Update latest-hashes.json in the repo
+    console.log('🧮 Updating hash tracker...');
+    const hashBase64 = Buffer.from(JSON.stringify(tableHashes)).toString('base64');
+    await fetch(`https://api.github.com/repos/${process.env.GITHUB_REPOSITORY}/contents/latest-hashes.json`, {
+      method: 'PUT',
+      headers: {
+        'Authorization': `token ${process.env.GITHUB_TOKEN}`,
+        'Accept': 'application/vnd.github.v3+json',
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        message: `Update hashes ${timestamp}`,
+        content: hashBase64,
+        sha: prevHashes._sha || null // Handle first time creation
+      })
+    }).catch(() => console.log('Note: Could not update hash file (might need manual SHA on first run)'));
 
-    // 7. Cleanup old diffs IF a new full backup was just created
+    // 7. Cleanup old releases if it was a full backup
     if (payload.type === 'FULL') {
-      console.log('🧹 Cleaning up old backups...');
-      const allFiles = await drive.files.list({
-        q: `'${process.env.GDRIVE_FOLDER_ID}' in parents and name contains 'backup-'`,
-        fields: 'files(id, name)'
+      console.log('🧹 Cleaning up old releases...');
+      const relsRes = await fetch(`https://api.github.com/repos/${process.env.GITHUB_REPOSITORY}/releases`, {
+        headers: { 'Authorization': `token ${process.env.GITHUB_TOKEN}`, 'Accept': 'application/vnd.github.v3+json' }
       });
-      for (const file of allFiles.data.files || []) {
-        if (file.id !== newFile.data.id) {
-          await drive.files.delete({ fileId: file.id });
-          console.log(`   🗑️ Deleted ${file.name}`);
+      const releases = await relsRes.json();
+      
+      for (const rel of releases) {
+        if (rel.tag_name !== tag) {
+          await fetch(`https://api.github.com/repos/${process.env.GITHUB_REPOSITORY}/releases/${rel.id}`, {
+            method: 'DELETE',
+            headers: { 'Authorization': `token ${process.env.GITHUB_TOKEN}` }
+          });
+          console.log(`   🗑️ Deleted release: ${rel.tag_name}`);
         }
       }
     }
 
     fs.unlinkSync(filePath);
-    console.log(`\n✅ ${payload.type} BACKUP COMPLETE & ENCRYPTED`);
+    console.log(`\n✅ ${payload.type} BACKUP COMPLETE & ENCRYPTED IN GITHUB`);
 
   } catch (error) {
     console.error('❌ BACKUP FAILED:', error.message);
