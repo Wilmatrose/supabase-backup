@@ -8,6 +8,9 @@ on:
 jobs:
   backup:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -22,12 +25,11 @@ jobs:
 
       - name: Run Backup
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DB_HOST: ${{ secrets.DB_HOST }}
           DB_PORT: ${{ secrets.DB_PORT }}
           DB_NAME: ${{ secrets.DB_NAME }}
           DB_USER: ${{ secrets.DB_USER }}
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
-          GCP_CLIENT_EMAIL: ${{ secrets.GCP_CLIENT_EMAIL }}
-          GCP_PRIVATE_KEY: ${{ secrets.GCP_PRIVATE_KEY }}
-          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+          ENCRYPTION_KEY: ${{ secrets.ENCRYPTION_KEY }}
         run: node src/backup.js
